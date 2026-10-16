@@ -9,6 +9,7 @@ import {randomUUID} from 'node:crypto'
 import {mkdirSync} from 'node:fs'
 import {dirname} from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
+import {logger} from '../logger.ts'
 
 export interface ListenerStore {
   insert: (input: IngestMessage) => {id: string; receivedAt: string}
@@ -40,6 +41,56 @@ const DEFAULT_LIST_LIMIT = 100
 const MIN_LIST_LIMIT = 1
 const MAX_LIST_LIMIT = 200
 
+/** Row ids already reported as carrying unreadable links (warn-once set). */
+const warnedUnreadableLinks = new Set<string>()
+
+/**
+ * rm-1460: `links` is JSON our own insert path wrote, but a corrupted or
+ * hand-edited row must fail closed — a read-path throw would 500 every
+ * list() (each operator poll) until the row ages out of retention.
+ * Unreadable, non-array, or wrong-element-shape payloads degrade to an
+ * empty link list plus ONE diagnostic per corrupt row (the poll loop
+ * re-reads the same rows); the message itself still renders.
+ */
+function isStoredLink(value: unknown): value is ListenerLink {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false
+  const link = value as {label?: unknown; url?: unknown}
+  return typeof link.label === 'string' && typeof link.url === 'string'
+}
+
+function readStoredLinks(row: MessageRow): readonly ListenerLink[] {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(row.links)
+  } catch {
+    warnUnreadableLinks(row, 'unreadable links JSON')
+    return []
+  }
+  if (!Array.isArray(parsed)) {
+    warnUnreadableLinks(row, 'non-array links JSON')
+    return []
+  }
+  // The every() type-guard check narrows the element type AND guarantees
+  // the runtime shape — or a corrupt-but-array payload (hand-edited row)
+  // would hand the renderer garbage objects. Ingest POLICY (https-only
+  // urls, label caps, MAX_LINKS) stays owned by the write path
+  // (contract.ts parseLinks); the read side checks shape only.
+  if (!parsed.every(isStoredLink)) {
+    warnUnreadableLinks(row, 'malformed link entries in links JSON')
+    return []
+  }
+  return parsed
+}
+
+function warnUnreadableLinks(row: MessageRow, reason: string): void {
+  if (warnedUnreadableLinks.has(row.id)) return
+  warnedUnreadableLinks.add(row.id)
+  logger.warning(
+    `listener store: ${reason} on stored message — serving degraded row with no links`,
+    {messageId: row.id, source: row.source},
+  )
+}
+
 function rowToMessage(row: MessageRow): ListenerMessage {
   return {
     id: row.id,
@@ -48,7 +99,7 @@ function rowToMessage(row: MessageRow): ListenerMessage {
     severity: row.severity as ListenerMessage['severity'],
     title: row.title,
     body: row.body,
-    links: JSON.parse(row.links) as readonly ListenerLink[],
+    links: readStoredLinks(row),
     dedupeKey: row.dedupe_key,
     createdAt: row.created_at,
     receivedAt: row.received_at,
